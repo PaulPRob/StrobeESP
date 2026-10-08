@@ -1,0 +1,19 @@
+# --- ESP-IDF firmware (led_strobe) ---
+# Build output and generated config (regenerated from sdkconfig.defaults)
+build/
+sdkconfig
+sdkconfig.old
+# Downloaded by the IDF component manager (pinned in dependencies.lock)
+managed_components/
+
+# --- Python GUI (strobe_gui) ---
+.venv/
+__pycache__/
+*.py[cod]
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
