@@ -1,8 +1,9 @@
 [project]
 name = "led-strobe-controller"
-version = "2.0.0"
+version = "3.0.0"
 description = "PyQt6 GUI for the led_strobe ESP32-C3-Zero firmware"
 requires-python = ">=3.12"
 dependencies = [
+    "bleak>=3.0.2",
     "pyqt6>=6.11.0",
 ]

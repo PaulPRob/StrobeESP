@@ -2,7 +2,9 @@
 """LED Strobe Controller - GUI for the led_strobe firmware on a Waveshare ESP32-C3-Zero.
 
 Sets flash frequency (0.5-200 Hz), duty cycle (1-99 %) and colour of the board's onboard
-RGB LED over its native USB serial port. All three colour channels flash together.
+RGB LED, over the board's USB cable or wirelessly over Bluetooth LE (PIN pairing; the PIN is
+shown in the "Bluetooth PIN" dialog while connected by USB). All three colour channels flash
+together.
 
 Colour model: a base colour (preset or picker) is mixed towards white by the "White mix"
 slider and scaled by "Brightness". Mixing is done in linear light and channel sliders are
@@ -14,13 +16,16 @@ Run with:  uv run strobe_controller.py
 import math
 import sys
 
-from PyQt6.QtCore import QIODeviceBase, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtCore import QIODeviceBase, QRegularExpression, QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QRegularExpressionValidator
 from PyQt6.QtSerialPort import QSerialPort, QSerialPortInfo
 from PyQt6.QtWidgets import (
-    QApplication, QColorDialog, QComboBox, QDoubleSpinBox, QFrame, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QMainWindow, QPushButton, QSlider, QVBoxLayout, QWidget,
+    QApplication, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPushButton, QSlider, QVBoxLayout, QWidget,
 )
+
+from ble_transport import BleTransport
 
 APP_NAME = "LED Strobe Controller"
 ESPRESSIF_VID = 0x303A
@@ -33,7 +38,8 @@ MIN_PULSE_MS = 0.3                # firmware's minimum on/off phase (WS2812 latc
 DIM_FLICKER_MS = 10.0             # on-times shorter than this may beat with the LED's own PWM
 SEND_DELAY_MS = 40                # coalesce rapid slider movement into one command
 HANDSHAKE_INTERVAL_MS = 300
-HANDSHAKE_TIMEOUT_MS = 5000       # board reboots when the port is opened
+HANDSHAKE_TIMEOUT_MS = 5000       # board reboots when the USB port is opened
+LINK_USB, LINK_BLE = "usb", "ble"
 
 PRESETS = [("Red", (1, 0, 0)), ("Orange", (1, 0.5, 0)), ("Yellow", (1, 1, 0)), ("Green", (0, 1, 0)),
            ("Cyan", (0, 1, 1)), ("Blue", (0, 0, 1)), ("Magenta", (1, 0, 1)), ("White", (1, 1, 1))]
@@ -102,6 +108,100 @@ class SliderSpin(QWidget):
         self.valueChanged.emit(v)
 
 
+def pin_line_edit() -> QLineEdit:
+    edit = QLineEdit(maxLength=6, placeholderText="6 digits")
+    edit.setValidator(QRegularExpressionValidator(QRegularExpression(r"\d{0,6}")))
+    edit.setFont(QFont("monospace", 14))
+    edit.setFixedWidth(130)
+    return edit
+
+
+class PinEntryDialog(QDialog):
+    """Asks for the board's PIN when a computer pairs with it for the first time."""
+
+    def __init__(self, parent, device_name):
+        super().__init__(parent)
+        self.setWindowTitle("Bluetooth pairing")
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(f"Enter the 6-digit PIN for <b>{device_name}</b>.<br>"
+                             "<small>To see the PIN, connect by USB and click <i>Bluetooth PIN...</i></small>"))
+        self.edit = pin_line_edit()
+        lay.addWidget(self.edit, 0, Qt.AlignmentFlag.AlignHCenter)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok.setEnabled(False)
+        self.edit.textChanged.connect(lambda t: self.ok.setEnabled(len(t) == 6))
+        lay.addWidget(buttons)
+
+    def pin(self):
+        return int(self.edit.text()) if self.exec() == QDialog.DialogCode.Accepted else None
+
+
+class PinManagerDialog(QDialog):
+    """USB-only: show or change the board's Bluetooth PIN and remove pairings."""
+
+    def __init__(self, parent, send):
+        super().__init__(parent)
+        self.send = send
+        self.setWindowTitle("Bluetooth PIN")
+        lay = QVBoxLayout(self)
+        self.pin_label = QLabel("PIN: ...")
+        self.pin_label.setFont(QFont("monospace", 16, QFont.Weight.Bold))
+        self.pin_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.ble_label = QLabel("")
+        self.ble_label.setWordWrap(True)
+        lay.addWidget(QLabel("Enter this PIN on a computer the first time it connects over Bluetooth:"))
+        lay.addWidget(self.pin_label)
+        lay.addWidget(self.ble_label)
+        row = QHBoxLayout()
+        self.new_pin = pin_line_edit()
+        self.set_btn = QPushButton("Set new PIN", enabled=False)
+        self.new_pin.textChanged.connect(lambda t: self.set_btn.setEnabled(len(t) == 6))
+        self.set_btn.clicked.connect(self._set_pin)
+        row.addWidget(QLabel("New PIN:"))
+        row.addWidget(self.new_pin)
+        row.addWidget(self.set_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+        lay.addWidget(QLabel("<small>Changing the PIN or removing pairings means every computer must "
+                             "pair again with the PIN.</small>", wordWrap=True))
+        bottom = QHBoxLayout()
+        unpair = QPushButton("Remove all pairings")
+        unpair.clicked.connect(self._unpair)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        bottom.addWidget(unpair)
+        bottom.addStretch(1)
+        bottom.addWidget(close)
+        lay.addLayout(bottom)
+        send("PIN")
+        send("BLE")
+
+    def _set_pin(self):
+        self.send(f"PIN {self.new_pin.text()}")
+        self.new_pin.clear()
+        self.send("BLE")
+
+    def _unpair(self):
+        if QMessageBox.question(self, "Remove pairings",
+                                "Remove all Bluetooth pairings from the board?") == QMessageBox.StandardButton.Yes:
+            self.send("UNPAIR")
+
+    def handle_line(self, line: str) -> bool:
+        if line.startswith("PIN "):
+            self.pin_label.setText(f"PIN: {line.split()[1]}")
+            return True
+        if line.startswith("BLE "):
+            st = parse_status(line)
+            self.ble_label.setText(f"Bluetooth name <b>{st.get('NAME', '?')}</b>, "
+                                   f"{st.get('STATE', '?').replace('-', ', ')}, "
+                                   f"{st.get('BONDS', '?')} paired computer(s)")
+            return True
+        return False
+
+
 class StrobeController(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -112,6 +212,16 @@ class StrobeController(QMainWindow):
         self.port.errorOccurred.connect(self._on_port_error)
         self.rx_buf = b""
         self.connected = False      # True once the firmware has answered ID
+        self.link = None            # LINK_USB / LINK_BLE while a connection is open
+        self.pin_dialog = None
+
+        self.ble = BleTransport(self)
+        self.ble.scan_finished.connect(self._ble_scan_finished)
+        self.ble.connected.connect(self._ble_connected)
+        self.ble.disconnected.connect(self._ble_disconnected)
+        self.ble.line_received.connect(self._handle_line)
+        self.ble.pin_requested.connect(self._ble_pin_requested)
+        self.ble.status.connect(self.statusBar().showMessage)
 
         # colour state (perceived 0..1): base colour with max channel 1, white mix, brightness
         self.base = [1.0, 0.0, 0.0]
@@ -123,7 +233,7 @@ class StrobeController(QMainWindow):
         self.handshake_elapsed = 0
 
         self._build_ui()
-        self._refresh_ports()
+        self._link_changed()
         self._set_controls_enabled(False)
 
     # ---------- UI ----------
@@ -134,15 +244,24 @@ class StrobeController(QMainWindow):
         # Connection
         conn = QGroupBox("Connection")
         cl = QHBoxLayout(conn)
-        self.port_combo = QComboBox(minimumWidth=220)
+        self.link_combo = QComboBox()
+        self.link_combo.addItem("USB cable", LINK_USB)
+        self.link_combo.addItem("Bluetooth", LINK_BLE)
+        self.link_combo.setCurrentIndex(max(0, self.link_combo.findData(self.settings.value("link", LINK_USB))))
+        self.link_combo.currentIndexChanged.connect(self._link_changed)
+        self.port_combo = QComboBox(minimumWidth=200)
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self._refresh_ports)
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self._toggle_connection)
-        cl.addWidget(QLabel("Port:"))
+        self.pin_btn = QPushButton("Bluetooth PIN...", enabled=False)
+        self.pin_btn.setToolTip("Show or change the board's Bluetooth PIN (USB connection only)")
+        self.pin_btn.clicked.connect(self._open_pin_manager)
+        cl.addWidget(self.link_combo)
         cl.addWidget(self.port_combo, 1)
         cl.addWidget(self.refresh_btn)
         cl.addWidget(self.connect_btn)
+        cl.addWidget(self.pin_btn)
         root.addWidget(conn)
 
         # Timing
@@ -354,8 +473,25 @@ class StrobeController(QMainWindow):
             out.append(min(1.0, to_perceived(v / 255 / (wb.value() / 100))))
         return out
 
-    # ---------- serial ----------
+    # ---------- connection ----------
+    def _selected_link(self):
+        return self.link_combo.currentData()
+
+    def _link_changed(self, _i=None):
+        self.settings.setValue("link", self._selected_link())
+        self.port_combo.clear()
+        self.refresh_btn.setEnabled(True)
+        self.connect_btn.setEnabled(True)
+        self.refresh_btn.setText("Scan" if self._selected_link() == LINK_BLE else "Refresh")
+        self._refresh_ports()
+
     def _refresh_ports(self):
+        if self._selected_link() == LINK_BLE:
+            self.refresh_btn.setEnabled(False)
+            self.connect_btn.setEnabled(False)
+            self.statusBar().showMessage("Scanning for LED-Strobe boards over Bluetooth...")
+            self.ble.scan()
+            return
         current = self.port_combo.currentData()
         self.port_combo.clear()
         ports = [p for p in QSerialPortInfo.availablePorts() if p.hasVendorIdentifier()]
@@ -374,40 +510,82 @@ class StrobeController(QMainWindow):
         if not ports:
             self.statusBar().showMessage("No USB serial ports found - is the board plugged in?")
 
+    def _ble_scan_finished(self, found):
+        if self._selected_link() != LINK_BLE or self.link is not None:
+            return
+        self.port_combo.clear()
+        for name, address, rssi in found:
+            self.port_combo.addItem(f"{name}  ({rssi} dBm)", (address, name))
+        self.refresh_btn.setEnabled(True)
+        self.connect_btn.setEnabled(True)
+        self.statusBar().showMessage(f"Found {len(found)} board(s)" if found else
+                                     "No LED-Strobe boards found - is the board powered and in range?")
+
     def _toggle_connection(self):
-        if self.port.isOpen():
+        if self.link is not None:
             self._disconnect("Disconnected")
             return
-        path = self.port_combo.currentData()
-        if not path:
-            self.statusBar().showMessage("No port selected")
+        target = self.port_combo.currentData()
+        if not target:
+            self.statusBar().showMessage("Nothing selected - press Scan" if self._selected_link() == LINK_BLE
+                                         else "No port selected")
             return
-        self.port.setPortName(path)
-        self.port.setBaudRate(115200)    # ignored by USB-Serial/JTAG, but required by Qt
-        if not self.port.open(QIODeviceBase.OpenModeFlag.ReadWrite):
-            self.statusBar().showMessage(f"Could not open {path}: {self.port.errorString()}")
-            return
-        self.port.setDataTerminalReady(False)
-        self.port.setRequestToSend(False)
         self.rx_buf = b""
         self.connected = False
         self.handshake_elapsed = 0
+        self._set_connecting_ui(True)
+        if self._selected_link() == LINK_BLE:
+            self.link = LINK_BLE
+            address, name = target
+            self.ble.open(address, name)
+            return
+        path = target
+        self.port.setPortName(path)
+        self.port.setBaudRate(115200)    # ignored by USB-Serial/JTAG, but required by Qt
+        if not self.port.open(QIODeviceBase.OpenModeFlag.ReadWrite):
+            self._set_connecting_ui(False)
+            self.statusBar().showMessage(f"Could not open {path}: {self.port.errorString()}")
+            return
+        self.link = LINK_USB
+        self.port.setDataTerminalReady(False)
+        self.port.setRequestToSend(False)
         self.handshake_timer.start()
-        self.connect_btn.setText("Disconnect")
-        self.port_combo.setEnabled(False)
-        self.refresh_btn.setEnabled(False)
         self.statusBar().showMessage(f"Opened {path}, waiting for the board...")
+
+    def _set_connecting_ui(self, busy: bool):
+        self.connect_btn.setText("Disconnect" if busy else "Connect")
+        for w in (self.link_combo, self.port_combo, self.refresh_btn):
+            w.setEnabled(not busy)
+
+    def _ble_connected(self, name):
+        if self.link == LINK_BLE and not self.connected:
+            self.statusBar().showMessage(f"Bluetooth link to {name} established, waiting for the board...")
+            self.handshake_timer.start()
+
+    def _ble_disconnected(self, reason):
+        if self.link == LINK_BLE:
+            self._disconnect(reason)
+
+    def _ble_pin_requested(self, name):
+        self.ble.provide_pin(PinEntryDialog(self, name).pin())
+
+    def _open_pin_manager(self):
+        self.pin_dialog = PinManagerDialog(self, self._write)
+        self.pin_dialog.exec()
+        self.pin_dialog = None
 
     def _disconnect(self, message: str):
         self.handshake_timer.stop()
         self.send_timer.stop()
+        if self.link == LINK_BLE:
+            self.ble.close()
         if self.port.isOpen():
             self.port.close()
+        self.link = None
         self.connected = False
         self._set_controls_enabled(False)
-        self.connect_btn.setText("Connect")
-        self.port_combo.setEnabled(True)
-        self.refresh_btn.setEnabled(True)
+        self.pin_btn.setEnabled(False)
+        self._set_connecting_ui(False)
         self.readback.setText("Not connected")
         self.note.setText("")
         self.statusBar().showMessage(message)
@@ -420,7 +598,9 @@ class StrobeController(QMainWindow):
         self._write("ID")
 
     def _write(self, line: str):
-        if self.port.isOpen():
+        if self.link == LINK_BLE:
+            self.ble.write(line)
+        elif self.port.isOpen():
             self.port.write((line + "\n").encode())
 
     def _run_toggled(self, on: bool):
@@ -452,12 +632,19 @@ class StrobeController(QMainWindow):
                 self._disconnect(f"Board has firmware {version}; this GUI needs {FW_REQUIRED}.x")
                 return
             self.connected = True
-            self.statusBar().showMessage(f"Connected to {self.port.portName()} - firmware {version}")
+            where = (f"{self.port_combo.currentData()[1]} over Bluetooth" if self.link == LINK_BLE
+                     else f"{self.port.portName()} over USB")
+            self.statusBar().showMessage(f"Connected to {where} - firmware {version}")
+            self.pin_btn.setEnabled(self.link == LINK_USB)
             self._write("?")     # adopt whatever the board is currently doing
         elif line.startswith("OK "):
             self._show_status(parse_status(line), adopt=not self.freq.isEnabled())
+        elif self.pin_dialog is not None and self.pin_dialog.handle_line(line):
+            pass
         elif line.startswith("ERR "):
             self.statusBar().showMessage(f"Board error: {line[4:]}")
+            if self.pin_dialog is not None:
+                QMessageBox.warning(self.pin_dialog, "Bluetooth PIN", line[4:])
         # anything else is boot/log output from the board; ignore it
 
     def _show_status(self, st: dict, adopt: bool):
@@ -498,12 +685,13 @@ class StrobeController(QMainWindow):
 
     def _on_port_error(self, err):
         if err in (QSerialPort.SerialPortError.ResourceError, QSerialPort.SerialPortError.PermissionError) \
-                and self.port.isOpen():
+                and self.port.isOpen() and self.link == LINK_USB:
             self._disconnect(f"Connection lost: {self.port.errorString()}")
 
     def closeEvent(self, event):
         if self.port.isOpen():
             self.port.close()
+        self.ble.shutdown()
         super().closeEvent(event)
 
 

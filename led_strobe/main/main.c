@@ -2,8 +2,9 @@
  * LED Strobe firmware for the Waveshare ESP32-C3-Zero.
  *
  * Flashes the onboard WS2812 RGB LED (GPIO10) in any RGB colour (0-255 per channel,
- * all channels flashing together) at 0.5-200 Hz with a 1-99 % duty cycle. Controlled by text commands over the native USB port
- * (USB-Serial/JTAG, /dev/ttyACM0); settings are saved to NVS and restored at boot.
+ * all channels flashing together) at 0.5-200 Hz with a 1-99 % duty cycle. Controlled by text
+ * commands over the native USB port (USB-Serial/JTAG, /dev/ttyACM0) or over Bluetooth LE
+ * (ble_link.c, PIN pairing required); settings are saved to NVS and restored at boot.
  *
  * Timing: a 1 MHz GPTimer alarm marks each on/off edge using absolute counts, so the
  * frequency doesn't drift. The ISR wakes a high-priority task that sends the WS2812 frame.
@@ -15,7 +16,8 @@
  * Channel levels below 255 are dimmed by the WS2812's own PWM (~0.4-2 kHz, free-running),
  * which can beat against short on-times; levels of 0 or 255 are unaffected.
  *
- * Protocol (one command per line, case-insensitive, replies end with \n):
+ * Protocol (one command per line, case-insensitive, replies end with \n). The same commands
+ * work over USB and Bluetooth, except PIN and UNPAIR which are accepted over USB only:
  *   ID                      -> ID LEDSTROBE <version>
  *   ? | GET                 -> status line
  *   F <hz>                  set frequency, 0.5 .. 200
@@ -24,6 +26,11 @@
  *   C <R|G|B|W>             shortcut: full red, green, blue or white
  *   RUN <0|1>               stop / start flashing
  *   SET <hz> <pct> <r> <g> <b> <0|1>   set everything at once
+ *   STATS                   LED update latency since the last STATS (timing diagnostics)
+ *   BLE                     Bluetooth name, state and number of paired devices
+ *   PIN                     (USB only) show the 6-digit Bluetooth pairing PIN
+ *   PIN <6 digits>          (USB only) set a new PIN; removes all existing pairings
+ *   UNPAIR                  (USB only) remove all pairings
  * Status/OK reply: OK F=<hz> D=<pct> RGB=<r>,<g>,<b> RUN=<0|1> ON_US=<us> OFF_US=<us> DEFF=<pct>
  * Errors:          ERR <message>
  */
@@ -34,6 +41,7 @@
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/gptimer.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
@@ -41,8 +49,9 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "led_strip.h"
+#include "strobe.h"
 
-#define FW_VERSION      "2.0"
+#define FW_VERSION      "2.1"
 #define LED_GPIO        10
 #define LED_COLOR_FMT   LED_STRIP_COLOR_COMPONENT_FMT_RGB   // C3-Zero LED is RGB order (verified)
 #define MIN_PULSE_US    300     // WS2812B reset/latch time + frame time, rounded up
@@ -51,6 +60,7 @@
 #define DUTY_MIN        1.0f
 #define DUTY_MAX        99.0f
 #define SAVE_DELAY_US   (2 * 1000 * 1000)   // debounce NVS writes while sliders move
+#define EDGE_FROM_TIMER 0x2                 // LED task notification flag: edge came from the timer
 
 typedef struct {
     float freq;     // Hz
@@ -72,6 +82,11 @@ static volatile uint32_t s_on_us, s_off_us;
 static volatile bool s_phase_on;
 static volatile uint64_t s_phase_start, s_next_alarm;
 static gptimer_alarm_config_t s_alarm;   // static (not const) so the ISR can use it
+static SemaphoreHandle_t s_cmd_mutex;      // serialises commands from USB and Bluetooth
+
+// Latency from timer edge to the end of the LED frame, in us (guarded by s_lock)
+static uint32_t s_lat_min = UINT32_MAX, s_lat_max, s_lat_n;
+static uint64_t s_lat_sum;
 
 static bool IRAM_ATTR on_alarm(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *ctx)
 {
@@ -85,7 +100,7 @@ static bool IRAM_ATTR on_alarm(gptimer_handle_t timer, const gptimer_alarm_event
     portEXIT_CRITICAL_ISR(&s_lock);
 
     BaseType_t woken = pdFALSE;
-    xTaskNotifyFromISR(s_led_task, on, eSetValueWithOverwrite, &woken);
+    xTaskNotifyFromISR(s_led_task, on | EDGE_FROM_TIMER, eSetValueWithOverwrite, &woken);
     return woken == pdTRUE;
 }
 
@@ -103,10 +118,21 @@ static void led_show(bool on)
 
 static void led_task(void *arg)
 {
-    uint32_t on;
+    uint32_t v;
     for (;;) {
-        xTaskNotifyWait(0, 0, &on, portMAX_DELAY);
-        led_show(on);
+        xTaskNotifyWait(0, 0, &v, portMAX_DELAY);
+        led_show(v & 1);
+        if (v & EDGE_FROM_TIMER) {
+            uint64_t now;
+            gptimer_get_raw_count(s_timer, &now);
+            portENTER_CRITICAL(&s_lock);
+            uint32_t lat = (uint32_t)(now - s_phase_start);
+            if (lat < s_lat_min) s_lat_min = lat;
+            if (lat > s_lat_max) s_lat_max = lat;
+            s_lat_sum += lat;
+            s_lat_n++;
+            portEXIT_CRITICAL(&s_lock);
+        }
     }
 }
 
@@ -205,10 +231,10 @@ static void load_settings(void)
     }
 }
 
-static void print_status(void)
+static void format_status(char *out, size_t outlen)
 {
     uint32_t on = s_on_us, off = s_off_us;
-    printf("OK F=%.3f D=%.2f RGB=%u,%u,%u RUN=%d ON_US=%lu OFF_US=%lu DEFF=%.2f\n",
+    snprintf(out, outlen, "OK F=%.3f D=%.2f RGB=%u,%u,%u RUN=%d ON_US=%lu OFF_US=%lu DEFF=%.2f\n",
            s_set.freq, s_set.duty, s_set.rgb[0], s_set.rgb[1], s_set.rgb[2], s_set.run,
            (unsigned long)on, (unsigned long)off, 100.0 * on / (on + off));
 }
@@ -239,21 +265,57 @@ static bool parse_float(const char *t, float lo, float hi, float *out)
     return true;
 }
 
-// Returns NULL on success or an error message
-static const char *handle_command(char *line)
+static void format_stats(char *out, size_t outlen)
 {
-    char *cmd = strtok(line, " \t");
-    if (!cmd) return "";
-    char *a1 = strtok(NULL, " \t"), *a2 = strtok(NULL, " \t");
-    char *a3 = strtok(NULL, " \t"), *a4 = strtok(NULL, " \t");
-    char *a5 = strtok(NULL, " \t"), *a6 = strtok(NULL, " \t");
+    portENTER_CRITICAL(&s_lock);
+    uint32_t n = s_lat_n, mn = s_lat_min, mx = s_lat_max;
+    uint64_t sum = s_lat_sum;
+    s_lat_n = 0, s_lat_sum = 0, s_lat_min = UINT32_MAX, s_lat_max = 0;
+    portEXIT_CRITICAL(&s_lock);
+    if (n == 0) {
+        snprintf(out, outlen, "STATS N=0\n");
+    } else {
+        snprintf(out, outlen, "STATS N=%lu LAT_MIN_US=%lu LAT_AVG_US=%lu LAT_MAX_US=%lu\n",
+                 (unsigned long)n, (unsigned long)mn, (unsigned long)(sum / n), (unsigned long)mx);
+    }
+}
+
+// Writes the reply to out and returns NULL, or returns an error message
+static const char *handle_command(char *line, bool from_usb, char *out, size_t outlen)
+{
+    char *save;
+    char *cmd = strtok_r(line, " \t", &save);
+    if (!cmd) return "empty command";
+    char *a[6];
+    for (int i = 0; i < 6; i++) a[i] = strtok_r(NULL, " \t", &save);
+    char *a1 = a[0], *a2 = a[1], *a3 = a[2], *a4 = a[3], *a5 = a[4], *a6 = a[5];
     settings_t s = s_set;
 
     if (!strcasecmp(cmd, "ID")) {
-        printf("ID LEDSTROBE %s\n", FW_VERSION);
+        snprintf(out, outlen, "ID LEDSTROBE %s\n", FW_VERSION);
         return NULL;
     } else if (!strcmp(cmd, "?") || !strcasecmp(cmd, "GET")) {
-        print_status();
+        format_status(out, outlen);
+        return NULL;
+    } else if (!strcasecmp(cmd, "STATS")) {
+        format_stats(out, outlen);
+        return NULL;
+    } else if (!strcasecmp(cmd, "BLE")) {
+        ble_link_status(out, outlen);
+        return NULL;
+    } else if (!strcasecmp(cmd, "PIN")) {
+        if (!from_usb) return "PIN is only available over USB";
+        if (a1) {
+            char *end;
+            unsigned long pin = strtoul(a1, &end, 10);
+            if (strlen(a1) != 6 || *end || !ble_link_set_pin(pin)) return "PIN must be 6 digits";
+        }
+        snprintf(out, outlen, "PIN %06lu\n", (unsigned long)ble_link_get_pin());
+        return NULL;
+    } else if (!strcasecmp(cmd, "UNPAIR")) {
+        if (!from_usb) return "UNPAIR is only available over USB";
+        ble_link_unpair_all();
+        ble_link_status(out, outlen);
         return NULL;
     } else if (!strcasecmp(cmd, "F")) {
         if (!parse_float(a1, FREQ_MIN, FREQ_MAX, &s.freq)) return "frequency must be 0.5-200";
@@ -276,18 +338,29 @@ static const char *handle_command(char *line)
         if (!a6 || (strcmp(a6, "0") && strcmp(a6, "1"))) return "RUN takes 0 or 1";
         s.run = a6[0] == '1';
     } else {
-        return "unknown command (ID, ?, F, D, RGB, C, RUN, SET)";
+        return "unknown command (ID, ?, F, D, RGB, C, RUN, SET, STATS, BLE, PIN, UNPAIR)";
     }
 
     apply(&s);
     esp_timer_stop(s_save_timer);
     esp_timer_start_once(s_save_timer, SAVE_DELAY_US);
-    print_status();
+    format_status(out, outlen);
     return NULL;
+}
+
+void strobe_command(const char *line, bool from_usb, char *out, size_t outlen)
+{
+    char buf[STROBE_LINE_MAX];
+    strlcpy(buf, line, sizeof(buf));
+    xSemaphoreTake(s_cmd_mutex, portMAX_DELAY);
+    const char *err = handle_command(buf, from_usb, out, outlen);
+    xSemaphoreGive(s_cmd_mutex);
+    if (err) snprintf(out, outlen, "ERR %s\n", err);
 }
 
 void app_main(void)
 {
+    s_cmd_mutex = xSemaphoreCreateMutex();
     load_settings();
 
     led_strip_config_t strip_cfg = {
@@ -320,6 +393,8 @@ void app_main(void)
     s_set.run = 0;
     apply(&boot);
 
+    ble_link_init();
+
     // Blocking line input over USB-Serial/JTAG
     usb_serial_jtag_driver_config_t ucfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&ucfg));
@@ -327,7 +402,7 @@ void app_main(void)
     setvbuf(stdin, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    char line[96];
+    char line[STROBE_LINE_MAX], reply[STROBE_REPLY_MAX];
     size_t n = 0;
     for (;;) {
         int ch = fgetc(stdin);
@@ -339,8 +414,8 @@ void app_main(void)
             if (n == 0) continue;
             line[n] = '\0';
             n = 0;
-            const char *err = handle_command(line);
-            if (err && err[0]) printf("ERR %s\n", err);
+            strobe_command(line, true, reply, sizeof(reply));
+            fputs(reply, stdout);
         } else if (n < sizeof(line) - 1) {
             line[n++] = (char)ch;
         }
